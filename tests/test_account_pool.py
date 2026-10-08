@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from core import converter
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity, billing_host
 from test_admin_server import credential
 
 
@@ -176,6 +176,90 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             result=self.pool.credits(c,{})
         self.assertEqual(result['packages'],101)
         self.assertEqual(result['remaining'],126.25)
+
+    def test_billing_host_follows_credential_domain(self):
+        # 国内站与国际站的计费接口不通用：跨站调用一律 401，必须按凭据域名选站。
+        self.assertEqual(billing_host({'X-Domain':'www.workbuddy.ai'}),'https://www.workbuddy.ai')
+        self.assertEqual(billing_host({'X-Domain':'WWW.WorkBuddy.AI'}),'https://www.workbuddy.ai')
+        self.assertEqual(billing_host({'X-Domain':'www.codebuddy.cn'}),'https://www.codebuddy.cn')
+        # 缺失或未知域名回退国内站，保持既有行为。
+        self.assertEqual(billing_host({}),'https://www.codebuddy.cn')
+        self.assertEqual(billing_host({'X-Domain':'example.com'}),'https://www.codebuddy.cn')
+
+        seen=[]
+        def handler(req):
+            seen.append(str(req.url))
+            return httpx.Response(200,json={'code':0,'data':{'Response':{'Data':{'TotalCount':0,'Accounts':[]}}}})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as c:
+            self.pool.credits(c,{'X-Domain':'www.workbuddy.ai'})
+        self.assertTrue(seen[0].startswith('https://www.workbuddy.ai/v2/billing/meter/get-user-resource'),seen[0])
+    def test_observe_cost_needs_enough_tokens(self):
+        # credit=0 但样本太小：上游对极小请求也会记 0，那不是真免费，不写账本。
+        self.pool.observe_cost(self.a,'m',{'credit':0,'total_tokens':150})
+        self.assertEqual(self.pool.cost_table(),{})
+        self.pool.observe_cost(self.a,'m',{'credit':0,'total_tokens':400})
+        self.assertEqual(self.pool.cost_table()['m'],{'cn':'free'})
+        # credit>0 与样本大小无关，一律记收费。
+        self.pool.observe_cost(self.a,'n',{'credit':0.02,'total_tokens':10})
+        self.assertEqual(self.pool.cost_table()['n'],{'cn':'paid'})
+        for usage in ({},{'credit':None},{'credit':True},{'credit':'x'}):
+            self.pool.observe_cost(self.a,'z',usage)
+        self.assertNotIn('z',self.pool.cost_table())
+        # 无模型名（auto）不记
+        self.pool.observe_cost(self.a,None,{'credit':0,'total_tokens':400})
+        self.assertEqual(len(self.pool.cost_table()),2)
+
+    def test_free_site_preference_and_fallback(self):
+        doc=credential('intl-one');doc['edition']='intl'
+        intl=self.store.save_browser_account(doc,'intl-one')['account_id']
+        self.assertEqual(self.pool.site_of(intl),'intl')
+        self.assertEqual(self.pool.site_of(self.a),'cn')
+        # 只有一边免费：没有可省的钱，不启用优先。
+        self.pool.observe_cost(intl,'hy4-preview',{'credit':0,'total_tokens':400})
+        self.assertEqual(self.pool.preferred_free_sites('hy4-preview'),set())
+        # 国内站实测收费 → 出现「一边免费一边收费」，优先国际站。
+        self.pool.observe_cost(self.a,'hy4-preview',{'credit':0.29,'total_tokens':400})
+        self.assertEqual(self.pool.preferred_free_sites('hy4-preview'),{'intl'})
+        self.assertEqual(self.pool.select(model='hy4-preview')[0],intl)
+        # 免费站账号不可用 → 回退到收费站，不报错。
+        self.store.data['accounts'][intl]['enabled']=False
+        self.assertIn(self.pool.select(model='hy4-preview')[0],(self.a,self.b))
+        self.store.data['accounts'][intl]['enabled']=True
+        # 都收费 / 都免费 都不启用优先，照常轮询。
+        self.pool.observe_cost(intl,'glm-5.3',{'credit':0.79,'total_tokens':400})
+        self.pool.observe_cost(self.a,'glm-5.3',{'credit':0.79,'total_tokens':400})
+        self.assertEqual(self.pool.preferred_free_sites('glm-5.3'),set())
+        self.pool.observe_cost(self.a,'hy3',{'credit':0,'total_tokens':400})
+        self.assertEqual(self.pool.preferred_free_sites('hy3'),set())
+        # 未知模型不启用优先
+        self.assertEqual(self.pool.preferred_free_sites('never-seen'),set())
+        self.assertEqual(self.pool.preferred_free_sites(None),set())
+    def test_low_balance_stops_paid_models(self):
+        # 余额见底后上游连免费模型都整体拒绝，所以留余量、不再接已实测收费的模型。
+        self.pool.update(self.a,remaining=30,packages=1,credits_updated=self.now)
+        self.pool.update(self.b,remaining=30,packages=1,credits_updated=self.now)
+        self.store.data['model_cost']={'paid-model':{'cn':'paid'}}
+        with self.assertRaises(HTTPException) as caught:
+            self.pool.select(model='paid-model')
+        self.assertIn('付费模型',caught.exception.detail)
+        self.assertIn('50',caught.exception.detail)
+        # 未知模型放行：账本只会慢慢积累，一律拦截会让低余额账号没法用
+        self.assertIn(self.pool.select(model='never-seen')[0],(self.a,self.b))
+        # 实测免费的模型放行
+        self.store.data['model_cost']['free-model']={'cn':'free'}
+        self.assertIn(self.pool.select(model='free-model')[0],(self.a,self.b))
+        # 余额回升到阈值以上就恢复
+        self.pool.update(self.a,remaining=500,credits_updated=self.now)
+        self.assertEqual(self.pool.select(model='paid-model')[0],self.a)
+        # 阈值调到 0 等于关闭保护
+        self.store.data['pool']['min_credits']=0
+        self.assertEqual(self.pool.can_serve(self.b,'paid-model'),True)
+
+    def test_low_balance_ignores_unknown_remaining(self):
+        # 余额未知（还没查过积分）不拦，否则新导入的账号会完全用不了
+        self.store.data['model_cost']={'paid-model':{'cn':'paid'}}
+        self.assertEqual(self.pool.remaining_of(self.a),None)
+        self.assertEqual(self.pool.can_serve(self.a,'paid-model'),True)
 
 
 if __name__=='__main__':unittest.main()

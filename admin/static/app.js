@@ -5,10 +5,20 @@ let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneratio
 const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
+  logs: ["请求日志", "REQUEST LOG", "请求记录按天落盘，重启不清零；只记录元数据，不含提示词与回复。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
 };
+const outcomes = {success:"完成", stream_error:"流式错误", interrupted:"未完整结束", http_error:"请求失败"};
+const outcomeOptions = [["", "全部结果"], ["success", "完成"], ["stream_error", "流式错误"], ["interrupted", "未完整结束"], ["http_error", "请求失败"]];
+const fmtNum = (value, digits = 2) => Number(value).toLocaleString("zh-CN", {maximumFractionDigits: digits});
+// 「最近请求」与「请求日志」共用同一行模板，保证两处外观完全一致。
+function requestRow(r) {
+  const site = r.site === "intl" ? "国际站" : r.site === "cn" ? "国内站" : "";
+  const account = r.account ? `${esc(r.account)}${site ? `<small class="cell-note">${site}</small>` : ""}` : '<span class="muted">—</span>';
+  return `<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === "test" ? "后台测试" : "API"}<small class="cell-note mono">${esc(r.path)}</small></td><td class="mono">${esc(r.key || "—")}</td><td class="mono">${esc(r.model || "—")}</td><td>${account}</td><td><span class="pill ${r.ok ? "green" : "red"}">${r.status ?? "—"}</span><small class="cell-note">${outcomes[r.outcome] || "请求失败"}</small></td><td class="align-right mono">${r.credits === null || r.credits === undefined ? "—" : fmtNum(r.credits)}</td><td class="align-right mono">${fmtNum(r.duration_ms)} ms</td></tr>`;
+}
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stamp = ts => ts ? new Date(ts).toLocaleString("zh-CN", {hour12:false}) : "未提供";
 function toast(message) { $("toast").textContent = message; $("toast").hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $("toast").hidden = true, 4500); }
@@ -37,6 +47,7 @@ function goPage(next) {
   const dot = document.createElement("span"); dot.className = "title-dot"; dot.textContent = "."; $("page-title").append(dot);
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
+  if (next === "logs") { loadLogs(true); loadServiceLog(); }
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
@@ -82,8 +93,7 @@ function renderDashboard() {
   const states={available:"可用",paused:"已暂停",cooling:"冷却中",exhausted:"积分耗尽",invalid:"凭据异常"};
   $("dash-account-list").innerHTML = accounts.slice(0,8).map(a=>`<div class="dashboard-account"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong><small class="cell-note">${esc(a.uid || a.nickname)}</small></div><div class="dashboard-account-credit"><strong>${a.remaining === null || a.remaining === undefined ? "待查询" : fmt(a.remaining)}</strong><small class="cell-note">积分</small></div><span class="pill ${a.pool_state === 'available' ? 'green' : 'amber'}">${states[a.pool_state] || '待查询'}</span></div>`).join("") || '<p class="history-empty">尚未添加账号，点击“添加账号”开始。</p>';
   if(accounts.length > 8) $("dash-account-list").insertAdjacentHTML("beforeend",'<p class="muted">更多账号请前往账号池查看。</p>');
-  const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
-  $("dash-recent-body").innerHTML=(m.recent || []).map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === 'test' ? '后台测试' : 'API'}<small class="cell-note mono">${esc(r.path)}</small></td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${fmt(r.duration_ms)} ms</td></tr>`).join("") || '<tr><td colspan="4" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+  $("dash-recent-body").innerHTML=(m.recent || []).map(requestRow).join("") || '<tr><td colspan="8" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
 }
 document.querySelectorAll("[data-dashboard-page]").forEach(b=>b.addEventListener("click",()=>goPage(b.dataset.dashboardPage)));
 $("dash-add").addEventListener("click",()=>openAccount());
@@ -96,9 +106,159 @@ function renderAccounts() {
   $("accounts-body").innerHTML = rows.map(a => {
     const status = labels[a.pool_state] || ["待查询", ""];
     const credits = a.remaining === null || a.remaining === undefined ? "—" : Number(a.remaining).toLocaleString("zh-CN",{maximumFractionDigits:2});
-    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${a.active ? '<span class="mini-active">手动 / 测试账号</span>' : ""}</strong><small>${esc(a.uid || a.nickname)}</small></div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td><td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}${a.enabled && !a.active ? `<button class="switch" data-action="activate" data-id="${a.id}">设为手动 / 测试</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
+    const site = a.site === "intl" ? '<span class="mini-active">国际站</span>' : (a.site ? '<span class="mini-active">国内站</span>' : "");
+    return `<tr><td><div class="account-cell"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}${site}${a.active ? '<span class="mini-active">手动 / 测试账号</span>' : ""}</strong><small>${esc(a.uid || a.nickname)}</small></div></div></td><td><span class="pill ${status[1]}">${status[0]}</span><small class="cell-note">${a.today_checked_in ? "今日已签到" : "今日未确认签到"}</small>${a.cooldown_until > Date.now()/1000 ? `<small class="cell-note">至 ${esc(stamp(a.cooldown_until*1000))}</small>` : ""}</td><td><strong class="credit-number">${credits}</strong><small class="cell-note">${a.credits_updated ? esc(stamp(a.credits_updated*1000)) : "点击查询积分"}${a.credits_stale && a.credits_updated ? " · 待刷新" : ""}</small>${a.last_error ? `<small class="cell-note field-error">${esc(a.last_error)}</small>` : ""}</td><td class="mono">${esc(stamp(a.expires_at))}<small class="cell-note">${a.expired ? "已到期 · 调用时尝试刷新" : "支持自动刷新"}</small></td><td><div class="actions pool-actions">${a.enabled ? `<button data-action="status" data-id="${a.id}" title="查询积分与签到状态">查询积分</button><button data-action="checkin" data-id="${a.id}">签到</button><button data-action="refresh" data-id="${a.id}">刷新凭据</button>` : ""}${a.enabled && !a.active ? `<button class="switch" data-action="activate" data-id="${a.id}">设为手动 / 测试</button>` : ""}<button data-action="rename" data-id="${a.id}">备注</button><button data-action="toggle" data-id="${a.id}">${a.enabled ? "暂停" : "恢复"}</button><button class="danger" data-action="delete" data-id="${a.id}">删除</button></div></td></tr>`;
   }).join("") || (overview.accounts.length ? '<tr><td colspan="5" class="muted">没有符合筛选条件的账号。</td></tr>' : "");
+  renderModelCost();
 }
+
+function renderModelCost() {
+  const table = overview.model_cost || {};
+  const rows = Object.keys(table).sort().map(model => {
+    const entry = table[model] || {};
+    const cell = site => {
+      const verdict = entry[site];
+      if (verdict === "free") return '<span class="pill green">免费</span>';
+      if (verdict === "paid") return '<span class="pill amber">收费</span>';
+      return '<span class="muted">未实测</span>';
+    };
+    const preferred = entry.cn === "free" && entry.intl === "paid" ? "国内站" : entry.intl === "free" && entry.cn === "paid" ? "国际站" : "—";
+    return `<tr><td class="mono">${esc(model)}</td><td>${cell("cn")}</td><td>${cell("intl")}</td><td>${preferred === "—" ? '<span class="muted">不启用优先</span>' : `优先 ${preferred}`}</td></tr>`;
+  }).join("");
+  $("model-cost-body").innerHTML = rows || '<tr><td colspan="4" class="history-empty">尚无实测记录。发一次请求后，这里会记录该模型在两个站点的实际计费。</td></tr>';
+  $("model-cost-count").textContent = Object.keys(table).length;
+  renderThreshold();
+}
+function thresholdValue() {
+  const value = Number($("min-credits").value);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+function renderThreshold() {
+  // 用户正在输入时不要用服务端值覆盖他
+  if (document.activeElement !== $("min-credits")) {
+    $("min-credits").value = overview.pool?.min_credits ?? 50;
+  }
+  const threshold = thresholdValue();
+  const accounts = overview.accounts || [];
+  const low = accounts.filter(a => a.enabled && typeof a.remaining === "number" && threshold !== null && a.remaining <= threshold);
+  const unknown = accounts.filter(a => a.enabled && (a.remaining === null || a.remaining === undefined));
+  const parts = [];
+  if (threshold === null) {
+    parts.push("请输入 0 或更大的数字。");
+  } else if (threshold === 0) {
+    parts.push("当前已关闭低余额保护，所有账号都会承接付费模型。");
+  } else {
+    parts.push(`余额不超过 ${fmtNum(threshold)} 的账号有 ${low.length} 个${low.length ? `（${low.map(a => a.name).join("、")}）` : ""}，它们不再承接已实测收费的模型；免费模型与尚未实测的模型不受影响。`);
+  }
+  if (unknown.length) parts.push(`另有 ${unknown.length} 个账号余额未知（${unknown.map(a => a.name).join("、")}），暂不拦截。`);
+  $("min-credits-note").textContent = parts.join(" ");
+}
+async function saveThreshold() {
+  const threshold = thresholdValue();
+  if (threshold === null) { toast("阈值需为 0 或更大的数字"); $("min-credits").value = overview.pool?.min_credits ?? 50; renderThreshold(); return; }
+  try {
+    await api("pool/settings", {method: "PATCH", body: {min_credits: threshold}});
+    overview.pool = {...(overview.pool || {}), min_credits: threshold};
+    toast(threshold === 0 ? "已关闭低余额保护" : `低余额保护阈值已设为 ${fmtNum(threshold)}`);
+  } catch (error) { toast(error.message); $("min-credits").value = overview.pool?.min_credits ?? 50; }
+  renderThreshold();
+}
+$("min-credits").addEventListener("change", saveThreshold);
+
+const logState = {limit: 100, records: [], hasMore: false, model: "", key: "", account: "", outcome: "", usage: null, loading: false};
+function logQuery() {
+  const params = new URLSearchParams({limit: logState.limit, offset: logState.records.length});
+  if (logState.model) params.set("model", logState.model);
+  if (logState.key) params.set("key", logState.key);
+  if (logState.account) params.set("account", logState.account);
+  if (logState.outcome) params.set("outcome", logState.outcome);
+  return params;
+}
+async function loadLogs(reset) {
+  if (logState.loading) return;
+  logState.loading = true;
+  if (reset) logState.records = [];
+  $("logs-more").disabled = true;
+  try {
+    const data = await api("logs?" + logQuery().toString());
+    logState.records = logState.records.concat(data.records || []);
+    logState.hasMore = !!data.has_more;
+    logState.usage = data.usage || null;
+    renderLogs();
+  } catch (error) { toast(error.message); }
+  finally { logState.loading = false; $("logs-more").disabled = !logState.hasMore; }
+}
+function renderLogs() {
+  const rows = logState.records.map(requestRow).join("");
+  $("logs-body").innerHTML = rows || `<tr><td colspan="8" class="history-empty">${logState.model || logState.key || logState.account || logState.outcome ? "没有符合筛选条件的记录。" : "尚无请求记录。"}</td></tr>`;
+  $("logs-count").textContent = logState.records.length;
+  $("logs-more").hidden = !logState.hasMore;
+  $("logs-more").disabled = !logState.hasMore;
+  const usage = logState.usage;
+  $("logs-usage").textContent = usage
+    ? `已加载 ${logState.records.length} 条 · 日志目录共 ${usage.files} 个文件、${(usage.bytes/1048576).toFixed(2)} MB · 请求日志覆盖 ${usage.request_days} 天 · 日志不会自动删除，请自行清理`
+    : "正在读取日志目录…";
+  $("logs-dir").textContent = usage ? usage.dir : "";
+}
+function logsFilterChanged() {
+  logState.model = $("logs-model").value.trim();
+  logState.key = $("logs-key").value.trim();
+  logState.account = $("logs-account").value.trim();
+  logState.outcome = $("logs-outcome").value;
+  loadLogs(true);
+}
+$("logs-outcome").replaceChildren(...outcomeOptions.map(([value, text]) => { const option = document.createElement("option"); option.value = value; option.textContent = text; return option; }));
+["logs-model", "logs-key", "logs-account"].forEach(id => $(id).addEventListener("change", logsFilterChanged));
+$("logs-outcome").addEventListener("change", logsFilterChanged);
+$("logs-refresh").addEventListener("click", () => loadLogs(true));
+$("logs-clear").addEventListener("click", () => {
+  $("logs-model").value = ""; $("logs-key").value = ""; $("logs-account").value = ""; $("logs-outcome").value = "";
+  logsFilterChanged();
+});
+$("logs-more").addEventListener("click", () => loadLogs(false));
+
+const levelPill = {WARNING: "amber", ERROR: "red", CRITICAL: "red"};
+const serviceState = {level: "", logger: "", entries: [], counts: {}, loggers: []};
+const SERVICE_ORDER = ["ERROR", "CRITICAL", "WARNING", "INFO", "DEBUG", "OTHER"];
+function renderServiceLevels() {
+  const counts = serviceState.counts || {};
+  const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+  const options = [["", `全部级别（${total}）`]];
+  SERVICE_ORDER.forEach(level => { if (counts[level]) options.push([level, `${level}（${counts[level]}）`]); });
+  $("service-level").replaceChildren(...options.map(([value, text]) => { const option = document.createElement("option"); option.value = value; option.textContent = text; return option; }));
+  $("service-level").value = serviceState.level;
+  const loggerOptions = [["", "全部来源"]].concat((serviceState.loggers || []).map(item => [item.name, `${item.name}（${item.count}）`]));
+  $("service-logger").replaceChildren(...loggerOptions.map(([value, text]) => { const option = document.createElement("option"); option.value = value; option.textContent = text; return option; }));
+  $("service-logger").value = serviceState.logger;
+}
+function renderServiceLog() {
+  $("service-body").innerHTML = serviceState.entries.map(e => {
+    const detail = e.detail ? `<details class="log-detail"><summary>展开 ${e.detail.split("\n").length} 行详情</summary><pre>${esc(e.detail)}</pre></details>` : "";
+    return `<tr><td class="mono muted">${esc(e.time || "—")}</td><td>${e.level ? `<span class="pill ${levelPill[e.level] || ""}">${esc(e.level)}</span>` : '<span class="muted">—</span>'}</td><td class="mono">${esc(e.logger || "—")}</td><td>${esc(e.message)}${detail}</td></tr>`;
+  }).join("") || '<tr><td colspan="4" class="history-empty">暂无服务日志。服务启动并产生输出后，这里会自动记录。</td></tr>';
+  $("service-count").textContent = serviceState.entries.length;
+}
+async function loadServiceLog() {
+  try {
+    const params = new URLSearchParams({lines: 300});
+    if (serviceState.level) params.set("level", serviceState.level);
+    if (serviceState.logger) params.set("logger", serviceState.logger);
+    const data = await api("logs/service?" + params.toString());
+    serviceState.entries = data.entries || [];
+    serviceState.counts = data.counts || {};
+    serviceState.loggers = data.loggers || [];
+    renderServiceLevels();
+    renderServiceLog();
+  } catch (error) { toast(error.message); }
+}
+$("service-level").addEventListener("change", () => { serviceState.level = $("service-level").value; loadServiceLog(); });
+$("service-logger").addEventListener("change", () => { serviceState.logger = $("service-logger").value; loadServiceLog(); });
+$("service-clear").addEventListener("click", () => {
+  serviceState.level = ""; serviceState.logger = "";
+  $("service-level").value = ""; $("service-logger").value = "";
+  loadServiceLog();
+});
+$("service-refresh").addEventListener("click", loadServiceLog);
 $("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
 $("account-filter").addEventListener("change", () => { if(overview) renderAccounts(); });
 async function refresh() {

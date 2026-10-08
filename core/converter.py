@@ -63,13 +63,17 @@ from .responses_adapter import (
     responses_request_to_chat,
 )
 from .responses_projection import project_responses_chat_body
-from .system_identity import filter_system_identity
+from .system_identity import ensure_leading_system, filter_system_identity
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
 BACKEND = "https://copilot.tencent.com"
+# 国际站（WorkBuddy 国际版）走同一套 /v2/* 协议，仅域名与 Web Origin 不同。
+INTL_BACKEND = "https://www.workbuddy.ai"
+# 凭据 edition 字段中表示国际站的取值（空值/未知回退国内站）。
+INTL_EDITIONS = {"intl", "international", "global", "workbuddy.ai"}
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy2openai/2.0"
 
@@ -162,7 +166,7 @@ class CredentialManager:
         headers = self._build_headers_from(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
+        url = f"{self.backend()}/v2/plugin/auth/token/refresh"
         try:
             with httpx.Client(timeout=15) as c:
                 r = c.post(url, headers=headers, json={})
@@ -217,6 +221,25 @@ class CredentialManager:
         }
         return h
 
+    def edition(self) -> str:
+        """凭据所属站点：cn（默认）或 intl。
+
+        优先读 edition 字段；缺失时按 auth.domain 推断。
+        """
+        try:
+            doc = self._session()
+        except Exception:  # noqa: BLE001 - 读不到时按国内站处理
+            return "cn"
+        value = doc.get("edition")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+        domain = ((doc.get("auth") or {}).get("domain") or "").lower()
+        return "intl" if "workbuddy.ai" in domain else "cn"
+
+    def backend(self) -> str:
+        """该凭据对应的上游基础地址（国内站 / 国际站）。"""
+        return INTL_BACKEND if self.edition() in INTL_EDITIONS else BACKEND
+
     def get_headers(self) -> dict:
         """返回带最新 token 的后端请求 header；必要时先刷新。"""
         with self._lock:
@@ -269,140 +292,227 @@ NON_CHAT_MODEL_TAGS = {
     "text-to-image",
     "image-to-image",
     "text-to-video",
+    "image-to-video",
 }
+
+# 模型 ID 里出现这些关键词的是补全/内部功能，不属于聊天模型
+NON_CHAT_MODEL_KEYWORDS = ("completion", "rewrite", "jump", "codewise")
+
+
+# product.json 相对于 WorkBuddy 安装根目录的位置（Windows/Linux 与 macOS）
+_PRODUCT_JSON_RELS = (
+    "resources/app.asar.unpacked/cli/product.json",
+    "Contents/Resources/app.asar.unpacked/cli/product.json",
+)
+
+# 目录扫描结果缓存（避免每次请求都遍历文件系统）
+_PRODUCT_JSON_CACHE: tuple[float, list[Path]] = (0.0, [])
+_PRODUCT_JSON_TTL = 60.0
+
+
+def _workbuddy_install_roots() -> list[Path]:
+    """推断本机所有 WorkBuddy 安装根目录。
+
+    国内版（WorkBuddy）与国际版（WorkBuddy AI）可以并列安装，且**模型目录不同**
+    （国际版有 gpt-* / gemini-* / kimi-k3 等，国内版有 deepseek-v3-* 等），
+    因此需要把所有找到的目录都纳入，模型列表取并集。
+
+    来源：
+      1. WORKBUDDY_ELECTRON_PATH（可执行文件路径，取父目录）
+      2. WORKBUDDY_INSTALL_DIR（安装根目录）
+      3. 平台默认安装路径
+      4. 已发现目录的同级兄弟目录（覆盖 D:\\Apps\\workbuddyCN + workbuddyAI 这类并列安装）
+    """
+    roots: list[Path] = []
+
+    exe = os.environ.get("WORKBUDDY_ELECTRON_PATH")
+    if exe:
+        roots.append(Path(exe).expanduser().parent)
+    install = os.environ.get("WORKBUDDY_INSTALL_DIR")
+    if install:
+        roots.append(Path(install).expanduser())
+
+    if sys.platform == "darwin":  # macOS
+        roots.extend(
+            [
+                Path("/Applications/WorkBuddy.app/Contents"),
+                Path("/Applications/WorkBuddy AI.app/Contents"),
+            ]
+        )
+    elif sys.platform == "win32":  # Windows
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            programs = Path(local_app_data) / "Programs"
+            roots.extend([programs / "WorkBuddy", programs / "WorkBuddyAI"])
+        for program_files in ("C:/Program Files", "C:/Program Files (x86)"):
+            roots.append(Path(program_files) / "WorkBuddy")
+    else:  # Linux
+        roots.extend(
+            [
+                Path("/opt/WorkBuddy"),
+                Path("/opt/workbuddy"),
+                Path.home() / ".local/share/WorkBuddy",
+            ]
+        )
+
+    # 同级兄弟目录：只认名字里带 workbuddy 的，避免误收同目录下无关程序
+    for root in list(roots):
+        try:
+            parent = root.parent
+            if not parent.is_dir():
+                continue
+            for sibling in parent.iterdir():
+                if sibling.is_dir() and "workbuddy" in sibling.name.lower():
+                    roots.append(sibling)
+        except OSError:
+            continue
+
+    # 去重保序
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        try:
+            key = str(root.resolve()).lower()
+        except OSError:
+            key = str(root).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _find_workbuddy_product_jsons() -> list[Path]:
+    """返回本机所有可用的 product.json（国内版 + 国际版 + 环境变量指定）。
+
+    结果缓存 60 秒，避免每次请求都遍历文件系统。
+    """
+    global _PRODUCT_JSON_CACHE
+
+    now = time.time()
+    cached_at, cached = _PRODUCT_JSON_CACHE
+    if cached and now - cached_at < _PRODUCT_JSON_TTL:
+        return list(cached)
+
+    found: list[Path] = []
+    seen: set[str] = set()
+    for root in _workbuddy_install_roots():
+        for rel in _PRODUCT_JSON_RELS:
+            path = root / rel
+            try:
+                key = str(path.resolve()).lower()
+            except OSError:
+                key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if path.is_file():
+                    found.append(path)
+            except OSError:
+                continue
+
+    _PRODUCT_JSON_CACHE = (now, found)
+    return list(found)
 
 
 def _find_workbuddy_product_json() -> Path | None:
-    """
-    查找本机 WorkBuddy 应用的 product.json 配置文件。
-
-    WorkBuddy 在安装时会自动解压 asar 到 app.asar.unpacked 目录，
-    因此无需用户手动提取。
-
-    macOS: /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/product.json
-    Windows: %LOCALAPPDATA%\\Programs\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\product.json
-    Linux: /opt/WorkBuddy/resources/app.asar.unpacked/cli/product.json
+    """返回第一个可用的 product.json（保留旧接口；内部已支持多目录发现）。
 
     Returns:
         Path 对象如果找到配置文件，否则 None
     """
-    possible_paths = []
+    paths = _find_workbuddy_product_jsons()
+    return paths[0] if paths else None
 
-    if sys.platform == "darwin":  # macOS
-        possible_paths.extend(
-            [
-                # 标准安装路径（WorkBuddy 自动解压）
-                Path(
-                    "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/product.json"
-                ),
-                # 开发/调试：本地提取的目录
-                Path.home()
-                / "Desktop/workspace/opensource/codebuddy2api/workbuddy_extracted/cli/product.json",
-            ]
-        )
-    elif sys.platform == "win32":  # Windows
-        local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
-        possible_paths.extend(
-            [
-                local_app_data
-                / "Programs/WorkBuddy/resources/app.asar.unpacked/cli/product.json",
-                Path(
-                    "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/cli/product.json"
-                ),
-            ]
-        )
-    else:  # Linux
-        possible_paths.extend(
-            [
-                Path("/opt/WorkBuddy/resources/app.asar.unpacked/cli/product.json"),
-                Path.home() / ".local/share/WorkBuddy/cli/product.json",
-            ]
-        )
 
-    for path in possible_paths:
-        if path.exists() and path.is_file():
-            return path
+def _parse_models(product_json: Path) -> tuple[list[str], list[str]]:
+    """解析单个 product.json，返回 (默认模型, 其它聊天模型)。
 
-    return None
+    过滤规则：
+    1. 排除图片/视频生成模型（带 text-to-image / image-to-video 等 tag 的）
+    2. 排除没有上下文长度的条目 —— 国际版 product.json 里的图片/视频模型不带 tag，
+       特征是没有 maxInputTokens，这条规则是上面那条的补充
+    3. 排除 vendor 为 "tencent" 的内部模型（补全/跳转等）
+    4. 排除名称里带 completion / rewrite / jump / codewise 的内部功能
+    """
+    try:
+        data = json.loads(product_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        # 解析失败时静默降级，不影响服务启动
+        print(f"Warning: 无法解析 {product_json}: {e}", file=sys.stderr)
+        return [], []
+
+    preferred: list[str] = []
+    others: list[str] = []
+
+    for model in data.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+
+        # 1. 带生成类 tag 的非聊天模型
+        tags = model.get("tags") or []
+        if any(tag in NON_CHAT_MODEL_TAGS for tag in tags):
+            continue
+
+        # 2. 没有上下文长度 -> 不是文本聊天模型
+        if not model.get("maxInputTokens"):
+            continue
+
+        # 3. 腾讯内部模型
+        if model.get("vendor") == "tencent":
+            continue
+
+        # 4. 名称即内部功能
+        name_lower = model_id.lower()
+        if any(keyword in name_lower for keyword in NON_CHAT_MODEL_KEYWORDS):
+            continue
+
+        (preferred if model.get("isDefault") else others).append(model_id)
+
+    return preferred, others
 
 
 def _load_models_from_workbuddy() -> list[str]:
-    """
-    从本机 WorkBuddy product.json 读取模型列表。
+    """合并本机所有 product.json（国内版 + 国际版）的聊天模型列表。
 
-    过滤规则：
-    1. 只保留聊天模型（排除 text-to-image, text-to-video 等）
-    2. 排除 vendor 为 "tencent" 的内部模型（通常是补全/内部专用）
-    3. 返回模型 ID 列表
+    两个版本的模型目录并不相同，取并集才能覆盖全部可用模型。
+    默认模型（product.json 里 isDefault=true 的）排在前面。
 
     Returns:
-        模型 ID 列表，如果加载失败返回空列表
+        模型 ID 列表（已去重保序），没找到任何 product.json 时返回空列表
     """
-    product_json_path = _find_workbuddy_product_json()
-
-    if product_json_path is None:
-        return []
-
-    try:
-        with open(product_json_path, encoding="utf-8") as f:
-            data = json.load(f)
-
-        models = data.get("models", [])
-        chat_models = []
-
-        for model in models:
-            model_id = model.get("id")
-            if not model_id:
-                continue
-
-            # 过滤掉非聊天模型
-            tags = model.get("tags", [])
-            if any(tag in NON_CHAT_MODEL_TAGS for tag in tags):
-                continue
-
-            # 过滤掉内部模型（vendor 为 tencent 的通常是补全/跳转等内部功能）
-            vendor = model.get("vendor", "")
-            if vendor == "tencent":
-                continue
-
-            # 过滤掉名称中明显是补全/内部功能的模型
-            name_lower = model_id.lower()
-            if any(
-                keyword in name_lower
-                for keyword in ["completion", "rewrite", "jump", "codewise"]
-            ):
-                continue
-
-            chat_models.append(model_id)
-
-        return chat_models
-
-    except Exception as e:
-        # 解析失败时静默降级，不影响服务启动
-        print(
-            f"Warning: Failed to load models from WorkBuddy product.json: {e}",
-            file=sys.stderr,
-        )
-        return []
+    preferred: list[str] = []
+    others: list[str] = []
+    for product_json in _find_workbuddy_product_jsons():
+        head, tail = _parse_models(product_json)
+        preferred.extend(head)
+        others.extend(tail)
+    return list(dict.fromkeys(preferred + others))
 
 
 def get_available_models() -> list[str]:
     """
     获取可用的模型列表。
 
-    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
+    合并本机 WorkBuddy product.json（国内版 + 国际版）的模型目录。
+    本机客户端版本可能落后于服务端，因此再补充 DEFAULT_MODELS 中尚未出现的条目
+    （例如 deepseek-v4.1-flash 只由服务端提供，两个 product.json 里都没有）。
+    完全找不到 product.json 时只用 DEFAULT_MODELS。
 
     Returns:
         模型 ID 列表
     """
-    workbuddy_models = _load_models_from_workbuddy()
+    models = _load_models_from_workbuddy()
 
-    if workbuddy_models:
-        # 成功从 WorkBuddy 加载，使用动态列表
-        return workbuddy_models
-    else:
+    if not models:
         # 降级到硬编码列表
-        return DEFAULT_MODELS
+        return list(DEFAULT_MODELS)
+
+    models.extend(model for model in DEFAULT_MODELS if model not in models)
+    return models
 
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
@@ -466,6 +576,50 @@ def _log(msg: str):
 def _truncate(s: str, n: int = 80) -> str:
     s = str(s).replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
+
+
+def _usage_holder(request: Request) -> dict:
+    """给当前请求挂一个可写的 usage 容器，供管理后台的 ASGI 中间件读取。
+
+    Starlette 的 ``request.state`` 实际存在 ``scope["state"]`` 上，中间件拿到的是
+    同一个 dict 对象，因此这里后续写入的字段（例如上游返回的消耗积分）中间件在
+    请求结束时都能读到。
+    """
+    holder: dict = {}
+    try:
+        request.state.usage = holder
+    except Exception:
+        return {}
+    return holder
+
+
+def _record_usage(holder: dict | None, usage) -> None:
+    """把上游 usage 中的积分 / token 记入 holder；未挂容器（None）时什么也不做。"""
+    if holder is None or not isinstance(usage, dict):
+        return
+    for key in ("credit", "total_tokens", "prompt_tokens", "completion_tokens"):
+        value = usage.get(key)
+        if value is not None:
+            holder[key] = value
+
+
+def _scan_sse_usage(line: str, holder: dict | None) -> None:
+    """从一行上游 SSE 里提取 usage。
+
+    只在已挂容器、且该行出现 credit 字样时才解析 JSON，避免给每一条流式分片
+    都增加解析开销。
+    """
+    if holder is None or "credit" not in line:
+        return
+    payload = line[5:].strip() if line.startswith("data:") else line.strip()
+    if not payload or payload == "[DONE]":
+        return
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return
+    if isinstance(obj, dict):
+        _record_usage(holder, obj.get("usage"))
 
 
 def _check_auth(authorization: str | None, x_api_key: str | None):
@@ -547,6 +701,7 @@ async def chat_completions(
 ):
     _check_auth(authorization, x_api_key)
     cred = _cred()
+    usage_holder = _usage_holder(request)
 
     try:
         payload = await request.json()
@@ -602,6 +757,9 @@ async def chat_completions(
             strip_tool_metadata=True,
         )
 
+    # 上游硬性要求首条为 system prompt（否则 11128），缺失/被清空时补一条兜底
+    body = ensure_leading_system(body)
+
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
     tool_names = [
@@ -622,12 +780,12 @@ async def chat_completions(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid),
+            _stream_upstream(url, headers, body, model_name, t0, rid, usage_holder),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -657,6 +815,7 @@ async def chat_completions(
                 "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
             },
         )
+    _record_usage(usage_holder, collected.get("usage"))
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -793,11 +952,13 @@ async def _stream_upstream(
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
+    usage_out: dict | None = None,
 ):
     """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
 
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
     完整原始 SSE 累积后落盘到日志（调试用）。
+    usage_out 非空时，把上游 usage（含 credit）写入该容器供管理后台统计。
     """
     finish_reason = None
     tool_names: list[str] = []
@@ -825,6 +986,7 @@ async def _stream_upstream(
                 continue
             if obj.get("usage"):
                 usage.update(obj["usage"])
+                _record_usage(usage_out, obj["usage"])
             for ch in obj.get("choices") or []:
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
@@ -985,6 +1147,7 @@ async def create_response(
     """
     _check_auth(authorization, x_api_key)
     cred = _cred()
+    usage_holder = _usage_holder(request)
 
     try:
         payload = await request.json()
@@ -1022,6 +1185,9 @@ async def create_response(
     if os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
         chat_body = _chat_body_desensitize(chat_body)
 
+    # 上游硬性要求首条为 system prompt（否则 11128），缺失/被清空时补一条兜底
+    chat_body = ensure_leading_system(chat_body)
+
     client_wants_stream = bool(payload.get("stream", False))
     model_name = payload.get("model", "auto")
     rid = os.urandom(4).hex()
@@ -1044,12 +1210,12 @@ async def create_response(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_responses(url, headers, chat_body, model_name, t0, rid),
+            _stream_responses(url, headers, chat_body, model_name, t0, rid, usage_holder),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1068,6 +1234,7 @@ async def create_response(
             )
         converter = ResponsesStreamConverter(model=model_name)
         for line in raw.decode("utf-8", "replace").splitlines():
+            _scan_sse_usage(line, usage_holder)
             converter.feed_line(line)
         chat_body = final_body
     except HTTPException:
@@ -1101,6 +1268,7 @@ async def _stream_responses(
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
+    usage_out: dict | None = None,
 ):
     """消费后端 Chat SSE，实时转换为 Responses API 事件流输出。"""
     converter = ResponsesStreamConverter(model=model_name)
@@ -1119,6 +1287,7 @@ async def _stream_responses(
                     if line.strip():
                         raw_sse_lines.append(line)
                         raw_sse_lines = raw_sse_lines[-30:]
+                    _scan_sse_usage(line, usage_out)
                     events = converter.feed_line(line)
                     if events:
                         yield events.encode("utf-8")
@@ -1156,6 +1325,7 @@ async def create_message(
     """
     _check_auth(authorization, x_api_key)
     cred = _cred()
+    usage_holder = _usage_holder(request)
 
     try:
         payload = await request.json()
@@ -1212,6 +1382,9 @@ async def create_message(
             strip_tool_metadata=True,
         )
 
+    # 上游硬性要求首条为 system prompt（否则 11128），缺失/被清空时补一条兜底
+    chat_body = ensure_leading_system(chat_body)
+
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
     rid = os.urandom(4).hex()
@@ -1223,13 +1396,13 @@ async def create_message(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
     if user_stream:
         return StreamingResponse(
-            _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+            _stream_anthropic(url, headers, chat_body, model_name, t0, rid, usage_holder),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1238,7 +1411,7 @@ async def create_message(
     from fastapi.responses import JSONResponse
 
     response_data = await _collect_anthropic_nonstream(
-        url, headers, chat_body, model_name, t0, rid
+        url, headers, chat_body, model_name, t0, rid, usage_holder
     )
     return JSONResponse(content=response_data)
 
@@ -1250,6 +1423,7 @@ async def _collect_anthropic_nonstream(
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
+    usage_out: dict | None = None,
 ) -> dict:
     """收集完整的流式响应并返回非流式 Anthropic Message 对象。"""
     converter = AnthropicStreamConverter(model=model_name)
@@ -1274,6 +1448,7 @@ async def _collect_anthropic_nonstream(
                         },
                     )
                 async for line in r.aiter_lines():
+                    _scan_sse_usage(line, usage_out)
                     converter.feed_line(line)
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
@@ -1296,6 +1471,7 @@ async def _stream_anthropic(
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
+    usage_out: dict | None = None,
 ):
     """消费后端 OpenAI Chat SSE，实时转换为 Anthropic Messages SSE 事件流。"""
     converter = AnthropicStreamConverter(model=model_name)
@@ -1320,6 +1496,7 @@ async def _stream_anthropic(
                     yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
                     return
                 async for line in r.aiter_lines():
+                    _scan_sse_usage(line, usage_out)
                     events = converter.feed_line(line)
                     if events:
                         yield events.encode("utf-8")
@@ -1406,8 +1583,11 @@ async def count_tokens(
             strip_tool_metadata=True,
         )
 
+    # 上游硬性要求首条为 system prompt（否则 11128），缺失/被清空时补一条兜底
+    chat_body = ensure_leading_system(chat_body)
+
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:

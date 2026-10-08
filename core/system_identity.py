@@ -1,5 +1,6 @@
 """Remove client identity declarations from system/developer text only."""
 
+import os
 import re
 
 
@@ -80,3 +81,47 @@ def filter_system_identity(body: dict) -> dict:
         else:
             messages.append(message)
     return dict(body, messages=messages)
+
+
+# 上游硬性要求 messages 首条为 system prompt，否则返回：
+#   11128 "first message is not system prompt"
+# 客户端未提供 system，或 filter_system_identity 把 system 内容清空并整条删除后，
+# 首条会变成 user，触发拦截。这里补一条最小 system 兜底。
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def ensure_leading_system(body: dict, default: str | None = None) -> dict:
+    """确保 messages 以一条非空 system 消息开头。
+
+    必须在 filter_system_identity / 脱敏之后调用，避免兜底内容被再次清空。
+
+    Args:
+        body: 已构造好的 Chat Completions 请求体。
+        default: 兜底 system 内容；默认读环境变量 CODEBUDDY_DEFAULT_SYSTEM。
+
+    Returns:
+        新请求体；无需改动时原样返回。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    placeholder = (
+        default
+        if default is not None
+        else os.environ.get("CODEBUDDY_DEFAULT_SYSTEM", DEFAULT_SYSTEM_PROMPT)
+    )
+
+    first = messages[0] if messages else None
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        content = first.get("content")
+        has_text = (isinstance(content, str) and content.strip()) or (
+            isinstance(content, list) and len(content) > 0
+        )
+        if has_text:
+            return body
+        # 首条 system 存在但内容为空 -> 原地替换为兜底内容
+        return dict(body, messages=[dict(first, content=placeholder), *messages[1:]])
+
+    # 首条不是 system（缺失或被删除）-> 前置一条兜底 system
+    return dict(body, messages=[{"role": "system", "content": placeholder}, *messages])

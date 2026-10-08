@@ -13,9 +13,41 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
+from core.converter import INTL_EDITIONS
+
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
-BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
+# 计费接口按站点分域名：国内站与国际站的 token 互不通用，跨站调用一律 401。
+BILLING_HOSTS = {"cn": "https://www.codebuddy.cn", "intl": "https://www.workbuddy.ai"}
+BILLING_PATH = "/v2/billing/meter/"
+
+
+def billing_host(headers):
+    """按凭据的 X-Domain 选择计费域名；缺失或未知时回退国内站。"""
+    domain = str(headers.get("X-Domain") or "").lower()
+    return BILLING_HOSTS["intl"] if "workbuddy.ai" in domain else BILLING_HOSTS["cn"]
+
+
+# 站点维度的模型计费账本：{model: {"cn"|"intl": "free"|"paid"}}。
+#
+# 只信**实测** usage.credit，不信模型目录的 credits 倍率：目录是客户端展示清单，
+# 会漏模型（国际站目录里没有 deepseek-v4.1-flash，实测 846 tokens 仍 credit=0 免费），
+# 也会过期（国际站目录给 hy4-preview 标 x0.00，实测已经要计费）。
+#
+# 阈值取 300 而不是更小的值：credit 以 0.01 为步长取整，便宜模型在短请求下会
+# 四舍五入成 0。实测 glm-5.3-flash 国际站 187 tokens 记 0、337 tokens 就记 0.01，
+# 所以 100 会把「很便宜」误判成「免费」。
+MODEL_FREE_MIN_TOKENS = 300
+
+# 余额低于此值时，不再把「已实测收费」的模型派给该账号。
+# 动机：余额见底后上游连免费模型都整体拒绝（429 / code=14018），
+# 留一点余量让账号还能继续承接免费模型。
+MIN_CREDITS_FOR_PAID = 50
+
+
+def model_site(headers):
+    """凭据所属站点标识，与计费域名同源判断。"""
+    return "intl" if billing_host(headers) == BILLING_HOSTS["intl"] else "cn"
 
 
 def number(value):
@@ -59,10 +91,13 @@ class AccountPool:
         self.cursor = 0
         self.jobs = asyncio.Lock()
         self.last_sync = 0
+        self._sites = {}
         with store.lock:
-            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00"})
+            store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True,
+                                           "checkin_time": "09:00", "min_credits": MIN_CREDITS_FOR_PAID})
             store.data.setdefault("account_status", {})
             store.data.setdefault("session_bindings", {})
+            store.data.setdefault("model_cost", {})
             store.save()
 
     def operation_lock(self, aid):
@@ -102,16 +137,152 @@ class AccountPool:
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
                         "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
-                        "request_count": status.get("request_count", 0)})
+                        "request_count": status.get("request_count", 0), "site": self.site_of(row["id"])})
         return rows
 
-    def select(self, affinity_key=None):
+    # ------------------------------------------------------------------
+    # 站点 / 计费账本
+    # ------------------------------------------------------------------
+
+    def site_of(self, aid):
+        """账号所属站点（cn / intl）。只读凭据文件、不触发网络刷新，可安全在持锁期间调用。"""
+        with self.store.lock:
+            item = self.store.data["accounts"].get(aid)
+        if not item:
+            return None
+        key = (item.get("file"), item.get("enabled"))
+        cached = self._sites.get(aid)
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            edition = str(self.store.manager_for(aid, item).edition() or "").strip().lower()
+            site = "intl" if edition in INTL_EDITIONS else "cn"
+        except Exception:  # noqa: BLE001 - 读不到凭据时按国内站处理，不影响可用性判断
+            site = "cn"
+        self._sites[aid] = (key, site)
+        return site
+
+    def observe_cost(self, aid, model, usage):
+        """从一次真实响应学习「该模型在该站点免费还是收费」。
+
+        只有实测 usage.credit 才算证据：credit>0 判收费；credit==0 且样本足够
+        （total_tokens ≥ MODEL_FREE_MIN_TOKENS）才判免费 —— 上游对极小请求也会记 0，
+        那不是真免费，不能据此把零余额账号送去跑收费模型。
+        """
+        if not model or not isinstance(usage, dict):
+            return
+        credit = usage.get("credit")
+        if credit is None or isinstance(credit, bool):
+            return
+        try:
+            credit = float(credit)
+        except (TypeError, ValueError):
+            return
+        if credit <= 0:
+            total = usage.get("total_tokens")
+            if not isinstance(total, (int, float)) or isinstance(total, bool) or total < MODEL_FREE_MIN_TOKENS:
+                return
+            verdict = "free"
+        else:
+            verdict = "paid"
+        site = self.site_of(aid)
+        if not site:
+            return
+        with self.store.lock:
+            entry = self.store.data.setdefault("model_cost", {}).setdefault(model, {})
+            if entry.get(site) == verdict:
+                return
+            entry[site] = verdict
+            self.store.save()
+
+    def preferred_free_sites(self, model):
+        """该模型「一个站点实测免费、另一个站点实测收费」时，返回应优先使用的站点集合。
+
+        都免费或都收费时返回空集 —— 那种情况下没有可省的钱，照常轮询即可。
+        """
+        if not model:
+            return set()
+        with self.store.lock:
+            entry = dict((self.store.data.get("model_cost") or {}).get(model) or {})
+        free = {site for site, verdict in entry.items() if verdict == "free"}
+        paid = {site for site, verdict in entry.items() if verdict == "paid"}
+        if not free or not paid:
+            return set()
+        return free
+
+    def cost_table(self):
+        """账本快照，供管理后台展示。"""
+        with self.store.lock:
+            return {model: dict(sites) for model, sites in (self.store.data.get("model_cost") or {}).items()}
+
+    def cost_verdict(self, site, model):
+        """该模型在该站点的实测计费结论：free / paid / None（未知）。"""
+        if not site or not model:
+            return None
+        with self.store.lock:
+            entry = (self.store.data.get("model_cost") or {}).get(model) or {}
+            return entry.get(site)
+
+    def min_credits(self):
+        """低余额保护阈值；0 表示关闭该保护。"""
+        with self.store.lock:
+            raw = (self.store.data.get("pool") or {}).get("min_credits", MIN_CREDITS_FOR_PAID)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return float(MIN_CREDITS_FOR_PAID)
+
+    def remaining_of(self, aid):
+        with self.store.lock:
+            status = self.store.data["account_status"].get(aid) or {}
+            return status.get("remaining")
+
+    def account_name(self, aid):
+        with self.store.lock:
+            item = self.store.data["accounts"].get(aid) or {}
+            return item.get("name")
+
+    def can_serve(self, aid, model):
+        """余额过低的账号不再承接已实测收费的模型。
+
+        未知模型放行：目录不可信、实测账本又只会慢慢积累，一律拦截会让
+        低余额账号几乎无法使用。真正要拦住的是「已经知道要花钱」的请求。
+        """
+        threshold = self.min_credits()
+        if threshold <= 0 or not model:
+            return True
+        remaining = self.remaining_of(aid)
+        if isinstance(remaining, bool) or not isinstance(remaining, (int, float)):
+            return True  # 余额未知：不拦
+        if remaining > threshold:
+            return True
+        return self.cost_verdict(self.site_of(aid), model) != "paid"
+
+    def select(self, affinity_key=None, model=None):
+        # 站点优先级必须在持锁前算好：preferred_free_sites 自己会取 store.lock。
+        preferred = self.preferred_free_sites(model)
         with self.store.lock:
             candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
             if self.store.data["pool"]["routing"] == "manual":
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
+            if preferred:
+                # 只在「免费站还有可用账号」时收窄候选；否则照常轮询，避免无谓失败。
+                narrowed = [row for row in candidates if self.site_of(row["id"]) in preferred]
+                if narrowed:
+                    candidates = narrowed
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+            # 低余额保护：余额 ≤ 阈值的账号不再接已实测收费的模型。
+            if model and self.min_credits() > 0:
+                affordable = [row for row in candidates if self.can_serve(row["id"], model)]
+                if not affordable:
+                    known = [self.remaining_of(row["id"]) for row in candidates]
+                    known = [value for value in known if isinstance(value, (int, float)) and not isinstance(value, bool)]
+                    lowest = f"，最低 {min(known):g}" if known else ""
+                    raise HTTPException(
+                        503, f"模型 {model} 在可用账号上都属于付费模型，而这些账号余额均不超过 "
+                             f"{self.min_credits():g}{lowest}。请补充积分、调整阈值，或改用免费模型。")
+                candidates = affordable
             now = self.clock()
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):
@@ -144,7 +315,7 @@ class AccountPool:
             self.store.save()
 
     def billing(self, client, headers, path, body=None):
-        response = client.post(BILLING + path, headers=headers, json=body or {})
+        response = client.post(billing_host(headers) + BILLING_PATH + path, headers=headers, json=body or {})
         if response.status_code != 200:
             raise BillingError("积分服务请求失败", response.status_code)
         try:
@@ -204,8 +375,6 @@ class AccountPool:
                     self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                     return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
                 headers = manager.get_headers()
-                if "workbuddy.ai" in str(headers.get("X-Domain", "")).lower():
-                    return {"id": aid, "ok": False, "message": "当前仅支持国内账号积分与签到"}
                 today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
                 with self.client_factory() as client:
                     message = "积分状态已更新"
@@ -335,6 +504,10 @@ class PoolMiddleware:
             except ValueError:
                 body = {}
             affinity_key = request_affinity(headers, body)
+            model = body.get("model")
+            model = model.strip() if isinstance(model, str) and model.strip() else None
+            if model == "auto":
+                model = None
             original_receive = receive
             delivered = False
             async def replay_receive():
@@ -344,20 +517,28 @@ class PoolMiddleware:
                     return {"type": "http.request", "body": raw, "more_body": False}
                 return await original_receive()
             receive = replay_receive
-            aid, manager = self.pool.select(affinity_key)
+            aid, manager = self.pool.select(affinity_key, model)
             # Refresh before entering a stream; retry another eligible account only
             # if credential preparation fails, never replay a partially emitted response.
             try:
                 await asyncio.to_thread(manager.get_headers)
             except Exception:
                 self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
-                aid, manager = self.pool.select(affinity_key)
+                aid, manager = self.pool.select(affinity_key, model)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
         except Exception:
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
         token = REQUEST_CREDENTIAL.set(manager)
+        # 把实际服务的账号挂到 scope["state"]，外层的指标中间件据此记录到请求日志。
+        try:
+            state = scope.setdefault("state", {})
+            if isinstance(state, dict):
+                state["account"] = {"id": aid, "name": self.pool.account_name(aid),
+                                    "site": self.pool.site_of(aid)}
+        except Exception:  # noqa: BLE001 - 记录失败不影响请求
+            pass
         status = 200
         buffer = b""
         async def observe(message):
@@ -371,6 +552,9 @@ class PoolMiddleware:
                     if line.startswith(b"data:"):
                         try:
                             obj = json.loads(line[5:])
+                            usage = obj.get("usage")
+                            if isinstance(usage, dict):
+                                self.pool.observe_cost(aid, model, usage)
                             err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
                             code = err.get("code") if isinstance(err, dict) else None
                             if isinstance(code, str) and code.isdigit():

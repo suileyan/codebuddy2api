@@ -32,7 +32,7 @@
 
 | 变量 | 用途 |
 |---|---|
-| `ADMIN_KEY` | 独立管理密钥，至少 20 字符，建议随机生成 |
+| `ADMIN_KEY` | 独立管理密钥，至少 8 字符（本地部署已从 20 位放宽），建议随机生成 |
 | `CODEBUDDY2OPENAI_KEY` | 首次迁入的客户端 Key；初始化后从持久化状态读取密钥列表 |
 | `CODEBUDDY_AUTH_DIR` | 登录凭据目录，线上 `/data/auth` |
 | `MANAGEMENT_DATA_DIR` | 账号索引与密钥摘要目录，线上 `/data/management` |

@@ -335,7 +335,7 @@ uv run python -m core.converter --desensitize --log converter.log
 - 客户端 API Key 创建与撤销、真实模型连接测试
 - 概览页：请求量、完成成功率、HTTP 成功率、平均耗时与最近 100 条请求
 
-本地启动（需先安装依赖并设置至少 20 位的管理密钥）：
+本地启动（需先安装依赖并设置至少 8 位的管理密钥，本地部署已从 20 位放宽）：
 
 ```bash
 export ADMIN_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(36))")

@@ -14,6 +14,7 @@ ENV/
 
 # 本地运行产物 / 日志
 *.log
+*.jsonl
 .DS_Store
 Thumbs.db
 
@@ -35,3 +36,6 @@ wheels/
 management-access.txt
 .idea/
 
+
+# AI 助手工作记忆（含本地运维信息，不提交）
+.workbuddy-ai/

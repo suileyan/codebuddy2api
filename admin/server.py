@@ -17,7 +17,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
+from core.workbuddy_atrest_crypto import decrypt_auth_field, is_encrypted_field
 from .browser_login import BrowserLogin
+from .logstore import LogStore, setup_logging
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
 
@@ -48,10 +50,36 @@ def clean_name(value, fallback):
     return value.strip()
 
 
+def display_name(doc, fallback):
+    """取可读账号名：明文 nickname → 解密 nickname → uid → fallback。
+
+    WorkBuddy 5.6.0+ 起 nickname 也可能是 $wbEncrypted 信封，解密依赖本机
+    WorkBuddy 可执行文件；不可用时降级为 uid，绝不抛错。
+    """
+    account = doc.get("account") if isinstance(doc, dict) else None
+    if isinstance(account, dict):
+        nick = account.get("nickname")
+        if isinstance(nick, str) and nick.strip():
+            return nick.strip()[:60]
+        if is_encrypted_field(nick):
+            try:
+                value = decrypt_auth_field(nick)
+            except Exception:  # noqa: BLE001 - 解密失败时降级，不影响导入
+                value = ""
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:60]
+        uid = account.get("uid")
+        if isinstance(uid, str) and uid:
+            return uid[:60]
+    return fallback
+
+
 class Store:
     def __init__(self, root, auth_dir, initial_key, admin_key):
-        if len(admin_key) < 20:
-            raise RuntimeError("ADMIN_KEY must contain at least 20 characters")
+        # 本地部署放宽到 8 位（上游默认 20 位）。服务仅监听回环地址，
+        # 且登录接口有同 IP 10 分钟内 8 次失败的限流兜底。
+        if len(admin_key) < 8:
+            raise RuntimeError("ADMIN_KEY must contain at least 8 characters")
         self.root, self.auth_dir = Path(root), Path(auth_dir)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.auth_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -75,7 +103,7 @@ class Store:
                 except (ValueError, OSError, HTTPException):
                     continue
                 aid = secrets.token_hex(8)
-                name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
+                name = display_name(doc, "已迁移账号")
                 self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
                 if self.data["active"] is None and not doc.get("disabled"):
                     self.data["active"] = aid
@@ -89,9 +117,16 @@ class Store:
         if not isinstance(doc, dict) or not isinstance(doc.get("auth"), dict) or not isinstance(doc.get("account"), dict):
             raise HTTPException(400, "需要桌面端 .info／JSON 登录文件，包含 auth 和 account 对象")
         for key in ("accessToken", "refreshToken"):
-            if not isinstance(doc["auth"].get(key), str) or not doc["auth"][key].strip():
+            value = doc["auth"].get(key)
+            # WorkBuddy 5.6.0+ 起 token 变为 {"$wbEncrypted":1,"envelope":...} 信封，
+            # 运行时由 CredentialManager 解密，这里只校验信封结构完整。
+            if is_encrypted_field(value):
+                if len(value.get("envelope", "")) > 65536:
+                    raise HTTPException(400, "凭据字段过长")
+                continue
+            if not isinstance(value, str) or not value.strip():
                 raise HTTPException(400, "凭据缺少 accessToken 或 refreshToken，请重新导出桌面端登录文件")
-            if len(doc["auth"][key]) > 65536:
+            if len(value) > 65536:
                 raise HTTPException(400, "凭据字段过长")
         if not isinstance(doc["account"].get("uid"), str) or not doc["account"]["uid"]:
             raise HTTPException(400, "凭据缺少 account.uid")
@@ -136,7 +171,7 @@ class Store:
                 raise HTTPException(400, "最多保存 100 个账号")
             aid = secrets.token_hex(8)
             write_json(self.auth_dir / (aid + ".info"), doc)
-            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
+            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or display_name(doc, "浏览器授权账号"), "created": int(time.time()), "enabled": True}
             if self.data["active"] is None:
                 self.data["active"] = aid
             self.save()
@@ -167,7 +202,7 @@ class Store:
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
-                row.update({"nickname": str(doc["account"].get("nickname") or ""), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
+                row.update({"nickname": display_name(doc, ""), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
             except (ValueError, OSError, KeyError):
                 row.update({"status": "invalid", "expired": True, "expires_at": 0, "refresh_available": False})
             result.append(row)
@@ -186,6 +221,24 @@ class Store:
             allowed = hashed in self.test_keys or any(hmac.compare_digest(hashed, item["hash"]) for item in self.data["keys"].values())
         if not allowed:
             raise HTTPException(401, "invalid api key")
+
+    def key_label(self, token):
+        """把客户端 API Key 映射成便于识别的一行文字（名称 · 掩码）。
+
+        只用于「最近请求」展示，拿不到时返回 None。不落盘、不记录原始密钥。
+        """
+        if not token:
+            return None
+        hashed = digest(token)
+        with self.lock:
+            if hashed in self.test_keys:
+                return "后台测试"
+            for item in self.data["keys"].values():
+                if hmac.compare_digest(hashed, item["hash"]):
+                    name = item.get("name") or "未命名"
+                    hint = item.get("hint") or ""
+                    return f"{name} · {hint}" if hint else name
+        return "未知密钥"
 
     def require_admin(self, req):
         sid = req.cookies.get(COOKIE, "")
@@ -237,7 +290,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
-    metrics = RequestMetrics()
+    logstore = LogStore(root or os.environ.get("MANAGEMENT_DATA_DIR", "/data/management"))
+    metrics = RequestMetrics(sink=logstore.append)
+    try:
+        metrics.restore(logstore.read(limit=100)["records"])
+    except Exception:  # noqa: BLE001 - 历史日志损坏时照常启动
+        pass
     @asynccontextmanager
     async def lifespan(app):
         async def reap():
@@ -272,9 +330,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     app.state.browser_login = browser_login
     app.state.pool = pool
     app.state.metrics = metrics
+    app.state.logstore = logstore
     app.add_middleware(AdminMiddleware)
     app.add_middleware(PoolMiddleware, pool=pool)
-    app.add_middleware(MetricsMiddleware, metrics=metrics)
+    app.add_middleware(MetricsMiddleware, metrics=metrics, key_lookup=store.key_label)
 
     async def payload(req):
         try:
@@ -374,7 +433,57 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         with store.lock:
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events), "model_cost": pool.cost_table(), "logs": logstore.usage()}
+
+    @app.post("/admin/api/model-cost")
+    async def model_cost(req: Request):
+        """把实测结果写进站点计费账本（对应网关的 probe 命令）。
+
+        调度器只会从真实响应里学，命中免费站要碰运气；这里允许外部探测脚本
+        直接把「某模型在某站免费/收费」灌进来，立即生效。
+        """
+        store.require_admin(req)
+        body = await payload(req)
+        incoming = body.get("model_cost")
+        if not isinstance(incoming, dict):
+            raise HTTPException(400, "model_cost 必须是对象")
+        merged, rejected = 0, 0
+        with store.lock:
+            ledger = store.data.setdefault("model_cost", {})
+            for model, sites in list(incoming.items())[:200]:
+                if not isinstance(model, str) or not model.strip() or len(model) > 200 or not isinstance(sites, dict):
+                    rejected += 1
+                    continue
+                entry = ledger.setdefault(model.strip(), {})
+                for site, verdict in sites.items():
+                    if site not in ("cn", "intl") or verdict not in ("free", "paid"):
+                        rejected += 1
+                        continue
+                    if entry.get(site) != verdict:
+                        entry[site] = verdict
+                        merged += 1
+            if merged:
+                store.save()
+            return {"ok": True, "updated": merged, "rejected": rejected, "model_cost": pool.cost_table()}
+
+    @app.get("/admin/api/logs")
+    async def logs(req: Request, limit: int = 100, offset: int = 0,
+                   model: str = "", key: str = "", outcome: str = "", account: str = ""):
+        """按时间倒序翻请求日志；只含元数据，不含提示词与回复。"""
+        store.require_admin(req)
+        result = logstore.read(limit=limit, offset=offset,
+                               model=model.strip() or None, key=key.strip() or None,
+                               outcome=outcome.strip() or None, account=account.strip() or None)
+        result["usage"] = logstore.usage()
+        return result
+
+    @app.get("/admin/api/logs/service")
+    async def service_logs(req: Request, lines: int = 300, level: str = "", logger: str = ""):
+        """读取服务运行日志，解析成结构化记录（最新在前）。"""
+        store.require_admin(req)
+        wanted = level.strip().upper()
+        return logstore.read_service(lines=lines, level=wanted or None,
+                                     logger=logger.strip() or None)
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
@@ -409,6 +518,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 if not isinstance(body["checkin_time"], str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", body["checkin_time"]):
                     raise HTTPException(400, "请选择有效的签到时间")
                 settings["checkin_time"] = body["checkin_time"]
+            if "min_credits" in body:
+                value = body["min_credits"]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1_000_000:
+                    raise HTTPException(400, "低余额阈值需为 0–1000000 之间的数字")
+                settings["min_credits"] = float(value)
             store.data["pool"] = settings
             store.save()
         return {"ok": True, "pool": settings}
@@ -419,7 +533,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         doc = body.get("credential")
         store.validate_credential(doc)
-        name = clean_name(body.get("name"), str(doc["account"].get("nickname") or "新账号")[:60])
+        name = clean_name(body.get("name"), display_name(doc, "新账号"))
         with store.lock:
             if len(store.data["accounts"]) >= 100:
                 raise HTTPException(400, "最多保存 100 个账号")
@@ -515,6 +629,14 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         model = body.get("model", "deepseek-v4-flash")
         prompt = body.get("prompt", "请只回复：连接成功")
+
+        def active_account():
+            """后台测试走的是当前选中账号，日志里也标出来。"""
+            with store.lock:
+                aid = store.data.get("active")
+                item = store.data["accounts"].get(aid) or {}
+            return {"name": item.get("name"), "site": pool.site_of(aid)}
+
         if not isinstance(model, str) or model not in converter.get_available_models():
             raise HTTPException(400, "请选择列表中的模型")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 2000:
@@ -530,7 +652,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
             try:
-                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test", key_lookup=store.key_label, account_lookup=active_account)), base_url="http://internal") as client:
                     result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
                 data = result.json()
                 answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") if result.status_code == 200 else ""
@@ -552,4 +674,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
 
 
 if __name__ == "__main__":
-    uvicorn.run(create_app(), host="0.0.0.0", port=8787, log_level="warning", proxy_headers=True, forwarded_allow_ips="*")
+    _app = create_app()
+    setup_logging(_app.state.logstore.dir)
+    uvicorn.run(_app, host="0.0.0.0", port=8787, log_level="warning",
+                proxy_headers=True, forwarded_allow_ips="*", log_config=None)
