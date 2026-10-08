@@ -10,6 +10,15 @@ PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages"}
 MAX_REQUEST_BYTES = 262144
 
 
+def _count(value):
+    """token 计数：只接受非负整数，其余（含 bool / 浮点 / 缺失）一律 None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0:
+        return None
+    return int(value)
+
+
 class RequestMetrics:
     def __init__(self, sink=None):
         self.lock = threading.Lock()
@@ -38,11 +47,13 @@ class RequestMetrics:
                 self.recent.append(record)
 
     def finish(self, path, source, status, ok, duration, outcome,
-               key=None, model=None, credits=None, account=None, site=None):
+               key=None, model=None, credits=None, account=None, site=None,
+               tokens=None, prompt_tokens=None, completion_tokens=None):
         record = {"time": int(time.time()), "path": path, "source": source,
                   "status": status, "ok": ok, "duration_ms": round(duration),
                   "outcome": outcome, "key": key, "model": model, "credits": credits,
-                  "account": account, "site": site}
+                  "account": account, "site": site, "tokens": tokens,
+                  "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
         with self.lock:
             self.in_flight -= 1
             self.total += 1
@@ -218,4 +229,7 @@ class MetricsMiddleware:
             site = served.get("site") if served.get("site") in ("cn", "intl") else None
             self.metrics.finish(path, self.source, status, ok, (time.monotonic()-start)*1000, outcome,
                                 key=key_label, model=self._request_model(request_buffer), credits=credits,
-                                account=account, site=site)
+                                account=account, site=site,
+                                tokens=_count(usage.get("total_tokens")),
+                                prompt_tokens=_count(usage.get("prompt_tokens")),
+                                completion_tokens=_count(usage.get("completion_tokens")))

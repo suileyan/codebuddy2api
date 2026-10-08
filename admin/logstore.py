@@ -32,6 +32,40 @@ FILE_HANDLER_NAME = "workbuddy2api-service-log"
 SERVICE_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+([A-Z]+)\s+([\w.]+)\s+(.*)$")
 SERVICE_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
+# 聚合统计：单日文件最多读取的字节数（超出时只取最近部分）。
+AGGREGATE_MAX_BYTES = 32 * 1024 * 1024
+# 聚合统计允许的最大天数跨度，避免一次拉太多把响应撑大。
+AGGREGATE_MAX_DAYS = 90
+
+
+def parse_day(value):
+    """把 'YYYY-MM-DD' 解析成 date；非法返回 None。"""
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def day_range(start, end):
+    """闭区间内的所有日期，按时间升序。"""
+    days, current = [], start
+    while current <= end:
+        days.append(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+    return days
+
+
+def _positive_float(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value) if value > 0 else 0.0
+
+
+def _positive_int(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value) if value > 0 else 0
+
 
 def _tail_bytes(path: Path, limit: int) -> bytes:
     """读取文件末尾最多 limit 字节，并丢弃开头可能被截断的半行。"""
@@ -139,6 +173,105 @@ class LogStore:
             if has_more:
                 break
         return {"records": records, "has_more": has_more, "days": self.days()}
+
+    # ------------------------------------------------------------------
+    # 用量聚合
+    # ------------------------------------------------------------------
+
+    def _day_records(self, day):
+        """逐条产出某天的请求记录；文件损坏或超大都只跳过、不抛错。"""
+        path = self.request_file(day)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        try:
+            with open(path, "rb") as handle:
+                if size > AGGREGATE_MAX_BYTES:
+                    handle.seek(size - AGGREGATE_MAX_BYTES)
+                    chunk = handle.read()
+                    _, _, chunk = chunk.partition(b"\n")  # 丢掉被截断的半行
+                else:
+                    chunk = handle.read()
+        except OSError:
+            return
+        for line in chunk.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                yield record
+
+    def aggregate(self, start, end, account=None, key=None):
+        """按日期范围聚合用量，供图表与排行榜使用。
+
+        只统计成功完成的请求（ok 为真）—— 失败请求没有可信的计费与 token 数据。
+        缺失的日期会补零，保证图表 X 轴连续。
+        """
+        days = day_range(start, end)
+        daily = {day: {"date": day, "requests": 0, "credits": 0.0, "tokens": 0} for day in days}
+        groups = {"models": {}, "accounts": {}, "keys": {}}
+        series = {}  # model -> {"credits": {day: n}, "tokens": {day: n}}
+        totals = {"requests": 0, "credits": 0.0, "tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+        for day in days:
+            for record in self._day_records(day):
+                if not record.get("ok"):
+                    continue
+                if account and record.get("account") != account:
+                    continue
+                if key and record.get("key") != key:
+                    continue
+                credits = _positive_float(record.get("credits"))
+                tokens = _positive_int(record.get("tokens"))
+                bucket = daily[day]
+                bucket["requests"] += 1
+                bucket["credits"] += credits
+                bucket["tokens"] += tokens
+                totals["requests"] += 1
+                totals["credits"] += credits
+                totals["tokens"] += tokens
+                totals["prompt_tokens"] += _positive_int(record.get("prompt_tokens"))
+                totals["completion_tokens"] += _positive_int(record.get("completion_tokens"))
+                for group, raw in (("models", record.get("model")),
+                                   ("accounts", record.get("account")),
+                                   ("keys", record.get("key"))):
+                    label = raw if isinstance(raw, str) and raw.strip() else "未记录"
+                    entry = groups[group].setdefault(label, {"name": label, "requests": 0, "credits": 0.0, "tokens": 0})
+                    entry["requests"] += 1
+                    entry["credits"] += credits
+                    entry["tokens"] += tokens
+                if isinstance(record.get("model"), str) and record["model"].strip():
+                    slot = series.setdefault(record["model"], {"credits": {}, "tokens": {}})
+                    slot["credits"][day] = slot["credits"].get(day, 0.0) + credits
+                    slot["tokens"][day] = slot["tokens"].get(day, 0) + tokens
+
+        def ranked(group):
+            rows = sorted(groups[group].values(), key=lambda item: (-item["credits"], -item["tokens"], item["name"]))
+            for row in rows:
+                row["credits"] = round(row["credits"], 4)
+            return rows
+
+        return {
+            "range": {"from": days[0], "to": days[-1], "days": len(days)},
+            "daily": [{**daily[day], "credits": round(daily[day]["credits"], 4)} for day in days],
+            "models": ranked("models"),
+            "accounts": ranked("accounts"),
+            "keys": ranked("keys"),
+            "series": [
+                {"model": model,
+                 "credits": [round(slot["credits"].get(day, 0.0), 4) for day in days],
+                 "tokens": [slot["tokens"].get(day, 0) for day in days]}
+                for model, slot in sorted(series.items(),
+                                          key=lambda item: (-sum(item[1]["credits"].values()),
+                                                            -sum(item[1]["tokens"].values()), item[0]))
+            ],
+            "totals": {**totals, "credits": round(totals["credits"], 4)},
+        }
 
     # ------------------------------------------------------------------
     # 服务运行日志

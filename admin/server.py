@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -19,7 +20,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from core import converter
 from core.workbuddy_atrest_crypto import decrypt_auth_field, is_encrypted_field
 from .browser_login import BrowserLogin
-from .logstore import LogStore, setup_logging
+from .logstore import AGGREGATE_MAX_DAYS, LogStore, parse_day, setup_logging
+from .logstore import CN as LOG_TZ
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
 
@@ -474,6 +476,28 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         result = logstore.read(limit=limit, offset=offset,
                                model=model.strip() or None, key=key.strip() or None,
                                outcome=outcome.strip() or None, account=account.strip() or None)
+        result["usage"] = logstore.usage()
+        return result
+
+    @app.get("/admin/api/usage")
+    async def usage(req: Request, start: str = "", end: str = "",
+                    account: str = "", key: str = ""):
+        """按日期范围聚合用量，供柱状图 / 折线图与排行榜使用。
+
+        只统计成功完成的请求；缺失日期补零，保证图表 X 轴连续。
+        """
+        store.require_admin(req)
+        today = datetime.now(LOG_TZ).date()
+        finish = parse_day(end) or today
+        begin = parse_day(start) or (finish - timedelta(days=6))
+        if begin > finish:
+            raise HTTPException(400, "开始日期不能晚于结束日期")
+        span = (finish - begin).days + 1
+        if span > AGGREGATE_MAX_DAYS:
+            raise HTTPException(400, f"时间跨度最多 {AGGREGATE_MAX_DAYS} 天，当前 {span} 天")
+        result = logstore.aggregate(begin, finish,
+                                    account=account.strip() or None,
+                                    key=key.strip() or None)
         result["usage"] = logstore.usage()
         return result
 

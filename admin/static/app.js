@@ -6,6 +6,7 @@ const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   logs: ["请求日志", "REQUEST LOG", "请求记录按天落盘，重启不清零；只记录元数据，不含提示词与回复。"],
+  usage: ["用量统计", "USAGE ANALYTICS", "按日聚合积分与 token 消耗，可按账号与密钥筛选，并查看模型用量排行。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
@@ -48,6 +49,7 @@ function goPage(next) {
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
   if (next === "logs") { loadLogs(true); loadServiceLog(); }
+  if (next === "usage") loadUsage();
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
@@ -259,6 +261,177 @@ $("service-clear").addEventListener("click", () => {
   loadServiceLog();
 });
 $("service-refresh").addEventListener("click", loadServiceLog);
+
+// ---------------------------------------------------------------------------
+// 用量统计
+// ---------------------------------------------------------------------------
+
+const SERIES_COLORS = ["#2f6f5e", "#7a9a3f", "#c07b2c", "#8a5a9e", "#3a6ea5"];
+const usageState = {range: "7", start: "", end: "", account: "", key: "", metric: "credits", dimension: "models", data: null, loading: false};
+const pad2 = value => String(value).padStart(2, "0");
+const dayStr = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const todayStr = () => dayStr(new Date());
+function shiftDays(day, delta) {
+  const [y, m, d] = String(day).split("-").map(Number);
+  return dayStr(new Date(y, m - 1, d + delta));
+}
+function metricLabel() { return usageState.metric === "tokens" ? "token" : "积分"; }
+function fmtMetric(value) {
+  if (value === null || value === undefined) return "—";
+  return usageState.metric === "tokens" ? fmtNum(value, 0) : fmtNum(value, 2);
+}
+function fmtCompact(value) {
+  const n = Number(value) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  return String(Math.round(n * 100) / 100);
+}
+function niceMax(value) {
+  if (!(value > 0)) return 1;
+  const base = Math.pow(10, Math.floor(Math.log10(value)));
+  const norm = value / base;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return step * base;
+}
+function chartFrame(days, max) {
+  const W = 720, H = 260, L = 58, R = 14, T = 16, B = 32;
+  const plotW = W - L - R, plotH = H - T - B;
+  const y = value => T + plotH - (max ? (value / max) * plotH : 0);
+  const slot = days.length ? plotW / days.length : plotW;
+  const center = index => L + slot * index + slot / 2;
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const value = (max / 4) * i, gy = y(value);
+    grid += `<line x1="${L}" y1="${gy.toFixed(1)}" x2="${W - R}" y2="${gy.toFixed(1)}" stroke="#e7ece7" stroke-width="1"/>`;
+    grid += `<text x="${L - 8}" y="${gy.toFixed(1)}" text-anchor="end" dominant-baseline="central" font-size="10" fill="#87918d">${fmtCompact(value)}</text>`;
+  }
+  const step = Math.max(1, Math.ceil(days.length / 8));
+  let axis = "";
+  days.forEach((day, index) => {
+    if (index % step !== 0 && index !== days.length - 1) return;
+    axis += `<text x="${center(index).toFixed(1)}" y="${H - B + 14}" text-anchor="middle" font-size="10" fill="#87918d">${esc(day.slice(5))}</text>`;
+  });
+  return {W, H, L, R, T, B, plotW, plotH, y, slot, center, grid, axis};
+}
+function renderBarChart(days, values) {
+  if (!days.length) return '<p class="history-empty">所选范围内没有数据。</p>';
+  const max = niceMax(Math.max(...values, 0));
+  const f = chartFrame(days, max);
+  const width = Math.max(1, f.slot * 0.62);
+  const bars = days.map((day, index) => {
+    const value = values[index] || 0;
+    const top = f.y(value);
+    const height = Math.max(value > 0 ? 1.5 : 0, f.T + f.plotH - top);
+    const x = (f.center(index) - width / 2).toFixed(1);
+    return `<rect x="${x}" y="${top.toFixed(1)}" width="${width.toFixed(1)}" height="${height.toFixed(1)}" rx="2" fill="#2f6f5e"><title>${esc(day)}　${fmtMetric(value)} ${metricLabel()}</title></rect>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${f.W} ${f.H}" width="100%" role="img" aria-label="每日用量柱状图">${f.grid}${f.axis}${bars}</svg>`;
+}
+function renderLineChart(days, series) {
+  if (!days.length) return '<p class="history-empty">所选范围内没有数据。</p>';
+  const max = niceMax(Math.max(...series.flatMap(item => item.values), 0));
+  const f = chartFrame(days, max);
+  const lines = series.map((item, index) => {
+    const color = SERIES_COLORS[index % SERIES_COLORS.length];
+    const points = item.values.map((value, i) => `${f.center(i).toFixed(1)},${f.y(value).toFixed(1)}`).join(" ");
+    const dots = item.values.map((value, i) =>
+      `<circle cx="${f.center(i).toFixed(1)}" cy="${f.y(value).toFixed(1)}" r="2.5" fill="${color}"><title>${esc(item.model)}　${esc(days[i])}　${fmtMetric(value)} ${metricLabel()}</title></circle>`).join("");
+    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>${dots}`;
+  }).join("");
+  return `<svg viewBox="0 0 ${f.W} ${f.H}" width="100%" role="img" aria-label="模型用量趋势折线图">${f.grid}${f.axis}${lines}</svg>`;
+}
+function renderUsageLegend(series) {
+  $("usage-legend").innerHTML = series.map((item, index) =>
+    `<span><i style="background:${SERIES_COLORS[index % SERIES_COLORS.length]}"></i>${esc(item.model)}</span>`).join("");
+}
+function renderUsage() {
+  const data = usageState.data;
+  if (!data) return;
+  const totals = data.totals || {};
+  $("usage-requests").textContent = fmtNum(totals.requests || 0, 0);
+  $("usage-credits").textContent = fmtNum(totals.credits || 0, 2);
+  $("usage-tokens").textContent = fmtNum(totals.tokens || 0, 0);
+  $("usage-split").textContent = `${fmtCompact(totals.prompt_tokens || 0)} / ${fmtCompact(totals.completion_tokens || 0)}`;
+  $("usage-bar-title").textContent = `每日用量（${metricLabel()}）`;
+  $("usage-bar-note").textContent = `${data.range.from} ~ ${data.range.to}，共 ${data.range.days} 天`;
+  const days = (data.daily || []).map(item => item.date);
+  const values = (data.daily || []).map(item => item[usageState.metric] || 0);
+  $("usage-bar").innerHTML = renderBarChart(days, values);
+  const series = (data.series || []).slice(0, 5).map(item => ({model: item.model, values: item[usageState.metric] || []}));
+  $("usage-line").innerHTML = renderLineChart(days, series);
+  renderUsageLegend(series);
+  renderUsageRank();
+  fillUsageFilters(data);
+}
+function fillUsageFilters(data) {
+  const fill = (id, rows, current, allLabel) => {
+    const select = $(id);
+    const options = [["", allLabel]].concat((rows || []).map(row => [row.name, `${row.name}（${row.requests}）`]));
+    select.replaceChildren(...options.map(([value, text]) => { const o = document.createElement("option"); o.value = value; o.textContent = text; return o; }));
+    select.value = options.some(([value]) => value === current) ? current : "";
+    if (select.value !== current) { usageState[id === "usage-account" ? "account" : "key"] = ""; }
+  };
+  fill("usage-account", data.accounts, usageState.account, "全部账号");
+  fill("usage-key", data.keys, usageState.key, "全部密钥");
+}
+function renderUsageRank() {
+  const data = usageState.data;
+  const rows = (data && data[usageState.dimension]) || [];
+  const metric = usageState.metric;
+  const total = rows.reduce((sum, row) => sum + (row[metric] || 0), 0);
+  $("usage-rank-note").textContent = rows.length
+    ? `${rows.length} 项，按${metricLabel()}降序，合计 ${fmtMetric(total)} ${metricLabel()}`
+    : "所选范围内没有数据";
+  $("usage-rank-body").innerHTML = rows.map((row, index) => {
+    const value = row[metric] || 0;
+    const share = total > 0 ? (value / total) * 100 : 0;
+    return `<tr><td class="rank-col mono muted">${index + 1}</td><td>${esc(row.name)}</td><td class="align-right mono">${fmtNum(row.requests, 0)}</td><td class="align-right mono">${fmtNum(row.credits, 2)}</td><td class="align-right mono">${fmtNum(row.tokens, 0)}</td><td><div class="share-cell"><span class="share-bar" style="width:${share.toFixed(1)}%"></span><small class="mono">${share.toFixed(1)}%</small></div></td></tr>`;
+  }).join("") || '<tr><td colspan="6" class="history-empty">所选范围内没有数据。</td></tr>';
+}
+async function loadUsage() {
+  if (usageState.loading) return;
+  usageState.loading = true;
+  $("usage-refresh").disabled = true;
+  const params = new URLSearchParams();
+  if (usageState.range === "today") {
+    params.set("start", todayStr()); params.set("end", todayStr());
+  } else if (usageState.range === "custom") {
+    if (usageState.start) params.set("start", usageState.start);
+    if (usageState.end) params.set("end", usageState.end);
+  } else {
+    params.set("end", todayStr());
+    params.set("start", shiftDays(todayStr(), -(Number(usageState.range) - 1)));
+  }
+  if (usageState.account) params.set("account", usageState.account);
+  if (usageState.key) params.set("key", usageState.key);
+  try {
+    usageState.data = await api("usage?" + params.toString());
+    renderUsage();
+  } catch (error) { toast(error.message); }
+  finally { usageState.loading = false; $("usage-refresh").disabled = false; }
+}
+function usageRangeChanged() {
+  const custom = usageState.range === "custom";
+  $("usage-start").hidden = !custom;
+  $("usage-end").hidden = !custom;
+  if (custom && !usageState.end) { usageState.end = todayStr(); $("usage-end").value = usageState.end; }
+  if (custom && !usageState.start) { usageState.start = shiftDays(todayStr(), -6); $("usage-start").value = usageState.start; }
+  loadUsage();
+}
+$("usage-range").addEventListener("change", () => { usageState.range = $("usage-range").value; usageRangeChanged(); });
+$("usage-start").addEventListener("change", () => { usageState.start = $("usage-start").value; loadUsage(); });
+$("usage-end").addEventListener("change", () => { usageState.end = $("usage-end").value; loadUsage(); });
+$("usage-account").addEventListener("change", () => { usageState.account = $("usage-account").value; loadUsage(); });
+$("usage-key").addEventListener("change", () => { usageState.key = $("usage-key").value; loadUsage(); });
+$("usage-metric").addEventListener("change", () => { usageState.metric = $("usage-metric").value; renderUsage(); });
+$("usage-dimension").addEventListener("change", () => { usageState.dimension = $("usage-dimension").value; renderUsageRank(); });
+$("usage-refresh").addEventListener("click", loadUsage);
+$("usage-clear").addEventListener("click", () => {
+  usageState.account = ""; usageState.key = ""; usageState.range = "7";
+  $("usage-range").value = "7"; $("usage-account").value = ""; $("usage-key").value = "";
+  usageRangeChanged();
+});
 $("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
 $("account-filter").addEventListener("change", () => { if(overview) renderAccounts(); });
 async function refresh() {
